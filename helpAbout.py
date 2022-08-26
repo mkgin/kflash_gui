@@ -5,11 +5,10 @@ from translation import tr, tr_en
 import time
 
 versionMajor = 1
-versionMinor = 5
-versionDev   = 4
+versionMinor = 8
+versionDev   = 1
 
-time_now = time.localtime(time.time())
-date = str(time_now.tm_year)+"."+str(time_now.tm_mon)+"."+str(time_now.tm_mday)
+date = "2022.06.20"
 
 def strAbout():
     pathDirList = sys.argv[0].replace("\\", "/").split("/")

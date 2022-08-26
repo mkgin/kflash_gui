@@ -1,10 +1,11 @@
 
 
 import sys, os
+import math
 import tempfile
 import parameters, helpAbout, autoUpdate, paremeters_save
 import translation
-from translation import tr, tr_en, tr2
+from translation import tr, tr_en, tr2, getCurrentLanguage
 from Combobox import ComboBox
 import json, zipfile, struct, hashlib
 
@@ -36,6 +37,8 @@ class MainWindow(QMainWindow):
     updateProgressPrintSignal = pyqtSignal(str)
     showSerialComboboxSignal = pyqtSignal()
     downloadResultSignal = pyqtSignal(bool, str)
+    eraseResultSignal = pyqtSignal(bool, str, bool)
+    eraseStatusSignal = pyqtSignal(str)
     DataPath = "./"
     app = None
     firmware_start_bytes = [b'\x21\xa8', b'\xef\xbe', b'\xad\xde']
@@ -54,13 +57,39 @@ class MainWindow(QMainWindow):
 
     def initVar(self):
         self.burning = False
+        self.erasing = False
+        self.erasingCanCancel = True
+        self.packing = False
         self.isDetectSerialPort = False
         self.DataPath = parameters.dataPath
         self.kflash = KFlash(print_callback=self.kflash_py_printCallback)
         self.saveKfpkDir = ""
-        self.packing = False
         self.zipTempFiles = []
         self.fileSelectWidgets = []
+        self.units = ["KiB", "B", "MiB"]
+        # load erase template
+        self.eraseTemplateConfigs = {}
+        eraseConfigPath = os.path.join(self.DataPath, "erase_config.json")
+        if os.path.exists(eraseConfigPath):
+            with open(eraseConfigPath, encoding='utf-8') as f:
+                self.eraseTemplateConfigs = json.load(f)
+        # convert language to local
+        config = {}
+        current_lang = getCurrentLanguage()
+        for key in self.eraseTemplateConfigs:
+            config[self.eraseTemplateConfigs[key]["lang"][current_lang]] = self.eraseTemplateConfigs[key]["config"]
+        self.eraseTemplateConfigs = config
+        # load boards info
+        self.boardsInfo = {}
+        boardsInfoPath = os.path.join(self.DataPath, "boards_info.json")
+        if os.path.exists(boardsInfoPath):
+            with open(boardsInfoPath, encoding='utf-8') as f:
+                self.boardsInfo = json.load(f)
+        # convert language to local
+        boards = {}
+        for key in self.boardsInfo:
+            boards[self.boardsInfo[key]['lang'][current_lang]] = self.boardsInfo[key]['type']
+        self.boardsInfo = boards
 
     def setWindowSize(self, w=520, h=550):
         self.resize(w, h)
@@ -135,7 +164,7 @@ class MainWindow(QMainWindow):
         QToolTip.setFont(QFont('SansSerif', 10))
         # main layout
         self.frameWidget = QWidget()
-        mainWidget = QSplitter(Qt.Horizontal)
+        mainWidget = QWidget()
         self.frameLayout = QVBoxLayout()
         self.settingWidget = QWidget()
         settingLayout = QVBoxLayout()
@@ -182,16 +211,51 @@ class MainWindow(QMainWindow):
         self.langButton = QPushButton()
         self.skinButton = QPushButton()
         self.aboutButton = QPushButton()
+        self.FuncCombobox = ComboBox()
+        self.FuncCombobox.addItem(tr("Firmware"))
+        self.FuncCombobox.addItem(tr("Erase"))
         self.langButton.setProperty("class", "menuItemLang")
         self.skinButton.setProperty("class", "menuItem2")
         self.aboutButton.setProperty("class", "menuItem3")
         self.langButton.setObjectName("menuItem")
         self.skinButton.setObjectName("menuItem")
         self.aboutButton.setObjectName("menuItem")
+        self.FuncCombobox.setObjectName("funcSelect")
         menuLayout.addWidget(self.langButton)
         menuLayout.addWidget(self.skinButton)
         menuLayout.addWidget(self.aboutButton)
         menuLayout.addStretch(0)
+        menuLayout.addWidget(self.FuncCombobox)
+
+        # widgets erase configuration
+        self.eraseGroupBox = QGroupBox(tr("Erase settings"))
+        self.eraseGroupBox.hide()
+        settingLayout.addWidget(self.eraseGroupBox)
+        eraseLayout = QGridLayout()
+        self.eraseGroupBox.setLayout(eraseLayout)
+        self.eraseModeCombobox = ComboBox()
+        self.eraseModeCombobox.addItem(tr("Partial erase"))
+        self.eraseModeCombobox.addItem(tr("Chip erase"))
+        self.eraseAddr = QLineEdit("0x00000")
+        self.eraseLen = QLineEdit("1")
+        self.eraseLenUnit = ComboBox()
+        self.eraseLenUnit.addItem("MiB")
+        self.eraseLenUnit.addItem("KiB")
+        self.eraseLenUnit.addItem("B")
+        self.eraseLoadConfigCombobox = ComboBox()
+        for key in self.eraseTemplateConfigs:
+            self.eraseLoadConfigCombobox.addItem(key)
+        self.eraseLoadButton = QPushButton(tr("Load"))
+        eraseLayout.addWidget(QLabel(tr("Mode")), 0, 0, 1, 1)
+        eraseLayout.addWidget(QLabel(tr("Address")), 1, 0, 1, 1)
+        eraseLayout.addWidget(QLabel(tr("Length")), 2, 0, 1, 1)
+        eraseLayout.addWidget(QLabel(tr("Load Template")), 3, 0, 1, 1)
+        eraseLayout.addWidget(self.eraseModeCombobox, 0, 1, 1, 2)
+        eraseLayout.addWidget(self.eraseAddr, 1, 1, 1, 2)
+        eraseLayout.addWidget(self.eraseLen, 2, 1, 1, 1)
+        eraseLayout.addWidget(self.eraseLenUnit, 2, 2, 1, 1)
+        eraseLayout.addWidget(self.eraseLoadConfigCombobox, 3, 1, 1, 1)
+        eraseLayout.addWidget(self.eraseLoadButton, 3, 2, 1, 1)
         
         # widgets file select
         self.fileSelectGroupBox = QGroupBox(tr("SelectFile"))
@@ -227,16 +291,8 @@ class MainWindow(QMainWindow):
         boardSettingsGroupBox.setLayout(boardSettingsLayout)
         self.boardLabel = QLabel(tr("Board"))
         self.boardCombobox = ComboBox()
-        self.boardCombobox.addItem(parameters.SipeedMaixDock)
-        self.boardCombobox.addItem(parameters.SipeedMaixBit)
-        self.boardCombobox.addItem(parameters.SipeedMaixBitMic)
-        self.boardCombobox.addItem(parameters.SipeedMaixduino)
-        self.boardCombobox.addItem(parameters.SipeedMaixGo)
-        self.boardCombobox.addItem(parameters.SipeedMaixGoD)
-        self.boardCombobox.addItem(parameters.M5StickV)
-        self.boardCombobox.addItem(parameters.KendryteKd233)
-        self.boardCombobox.addItem(parameters.kendryteTrainer)
-        self.boardCombobox.addItem(parameters.Auto)
+        for key in self.boardsInfo:
+            self.boardCombobox.addItem(key)
         self.burnPositionLabel = QLabel(tr("BurnTo"))
         self.burnPositionCombobox = ComboBox()
         self.burnPositionCombobox.addItem(tr("Flash"))
@@ -249,7 +305,7 @@ class MainWindow(QMainWindow):
         # widgets serial settings
         serialSettingsGroupBox = QGroupBox(tr("SerialSettings"))
         serialSettingsLayout = QGridLayout()
-        serialPortLabek = QLabel(tr("SerialPort"))
+        serialPortLabel = QLabel(tr("SerialPort"))
         serailBaudrateLabel = QLabel(tr("SerialBaudrate"))
         slowModeLabel = QLabel(tr("Speed mode"))
         self.serialPortCombobox = ComboBox()
@@ -268,8 +324,8 @@ class MainWindow(QMainWindow):
         self.slowModeCombobox.addItem(tr("Fast mode"))
         slowModeLabel.setToolTip(tr("slow mode tips"))
         self.slowModeCombobox.setToolTip(tr("slow mode tips"))
-        
-        serialSettingsLayout.addWidget(serialPortLabek,0,0)
+
+        serialSettingsLayout.addWidget(serialPortLabel,0,0)
         serialSettingsLayout.addWidget(serailBaudrateLabel, 1, 0)
         serialSettingsLayout.addWidget(slowModeLabel, 2, 0)
         serialSettingsLayout.addWidget(self.serialPortCombobox, 0, 1)
@@ -277,6 +333,20 @@ class MainWindow(QMainWindow):
         serialSettingsLayout.addWidget(self.slowModeCombobox, 2, 1)
         serialSettingsGroupBox.setLayout(serialSettingsLayout)
         settingLayout.addWidget(serialSettingsGroupBox)
+
+        # widgets SPI flash settings
+        spiFlashSettingsGroupBox = QGroupBox(tr("SpiFlashSettings"))
+        spiFlashSettingsLayout = QGridLayout()
+        spiFlashIoModeLabel = QLabel(tr("IO mode"))
+        spiFlashIoModeLabel.setToolTip(tr("flash io mode tips"))
+        self.spiFlashIoModeCombobox = ComboBox()
+        self.spiFlashIoModeCombobox.addItem(tr("DIO mode"))
+        self.spiFlashIoModeCombobox.addItem(tr("QIO mode"))
+        self.spiFlashIoModeCombobox.setToolTip(tr("flash io mode tips"))
+        spiFlashSettingsLayout.addWidget(spiFlashIoModeLabel,0,0)
+        spiFlashSettingsLayout.addWidget(self.spiFlashIoModeCombobox, 0, 1)
+        spiFlashSettingsGroupBox.setLayout(spiFlashSettingsLayout)
+        settingLayout.addWidget(spiFlashSettingsGroupBox)
 
         # set stretch
         settingLayout.setStretch(0,1)
@@ -292,6 +362,13 @@ class MainWindow(QMainWindow):
         # widgets download area
         self.downloadButton = QPushButton(tr("Download"))
         downloadLayout.addWidget(self.downloadButton)
+        # widgets erase area
+        self.eraseButton = QPushButton(tr("Erase"))
+        downloadLayout.addWidget(self.eraseButton)
+        self.eraseButton.hide()
+        self.eraseStatus = QLabel()
+        self.eraseStatus.hide()
+        downloadLayout.addWidget(self.eraseStatus)
 
         # main window
         self.statusBarStauts = QLabel()
@@ -318,13 +395,20 @@ class MainWindow(QMainWindow):
         self.errorSignal.connect(self.errorHint)
         self.hintSignal.connect(self.hint)
         self.downloadResultSignal.connect(self.downloadResult)
+        self.eraseResultSignal.connect(self.eraseResult)
+        self.eraseStatusSignal.connect(self.setEraseStatus)
         self.showSerialComboboxSignal.connect(self.showCombobox)
         self.updateProgressSignal.connect(self.updateProgress)
         self.updateProgressPrintSignal.connect(self.updateProgressPrint)
         self.langButton.clicked.connect(self.langChange)
         self.skinButton.clicked.connect(self.skinChange)
         self.aboutButton.clicked.connect(self.showAbout)
+        self.FuncCombobox.currentIndexChanged.connect(self.changeFunc)
         self.downloadButton.clicked.connect(self.download)
+        self.eraseButton.clicked.connect(self.erase)
+        self.eraseLoadButton.clicked.connect(self.eraseLoadConfig)
+
+        self.eraseModeCombobox.currentIndexChanged.connect(self.eraseModechange)
 
         self.addFileButton.clicked.connect(lambda: self.fileSelectLayout.addWidget(self.addFileSelectionItem()[1]))
         self.packFilesButton.clicked.connect(self.packFiles)
@@ -363,17 +447,229 @@ class MainWindow(QMainWindow):
         cp = QDesktopWidget().availableGeometry().center()
         qr.moveCenter(cp)
         self.move(qr.topLeft())
-
+    
+    def changeFunc(self):
+        if self.burning or self.packing or self.erasing:
+            self.hintSignal.emit(tr("Busy"), tr("Busy"))
+            return
+        func = self.FuncCombobox.currentText()
+        if func == tr("Erase"):
+            self.funcSwitch("Erase")
+        elif func == tr("Firmware"):
+            self.funcSwitch("Firmware")
+        self.setWindowSize()
+    
+    def funcSwitch(self, func):
+        # erase mode
+        if func == "Erase":
+            self.fileSelectGroupBox.hide()
+            self.downloadButton.hide()
+            self.burnPositionCombobox.hide()
+            self.burnPositionLabel.hide()
+            self.eraseButton.show()
+            self.eraseGroupBox.show()
+            self.eraseStatus.show()
+            self.statusBarStauts.setText("<font color=%s>%s</font>" %("#1aac2d", tr("EraseHint")))
+        # firmware download mode
+        elif func == "Firmware":
+            self.eraseButton.hide()
+            self.eraseGroupBox.hide()
+            self.eraseStatus.hide()
+            self.burnPositionLabel.show()
+            self.burnPositionCombobox.show()
+            self.fileSelectGroupBox.show()
+            self.downloadButton.show()
+            self.statusBarStauts.setText("<font color=%s>%s</font>" %("#1aac2d", tr("DownloadHint")))
 
     def highlightFirmwarePath(self, item, firmware):
         if firmware:
             item[3].setProperty("class", "qLineEditHighlight")
-            item[4].setText("0x00000")
+            # item[4].setText("0x00000")
         else:
             item[3].setProperty("class", "qLineEditNormal")
         self.frameWidget.style().unpolish(item[3])
         self.frameWidget.style().polish(item[3])
         self.frameWidget.update()
+
+    def eraseModechange(self):
+        if self.eraseModeCombobox.currentText() == tr("Chip erase"):
+            self.eraseAddr.setText("0x00000")
+            self.eraseLen.setText(tr("Full chip"))
+            self.eraseAddr.setDisabled(True)
+            self.eraseLen.setDisabled(True)
+            self.eraseLenUnit.setDisabled(True)
+        else:
+            self.eraseAddr.setText("0x00000")
+            self.eraseLen.setText("0")
+            self.eraseAddr.setDisabled(False)
+            self.eraseLen.setDisabled(False)
+            self.eraseLenUnit.setDisabled(False)
+
+    def erase(self):
+        if self.erasing:
+            if self.erasingCanCancel:
+                hint = "<font color=%s>%s</font>" %("#ff0d0d", tr("Erase Canceling"))
+                self.eraseStatus.setText(hint)
+                self.kflash.kill()
+                return
+            self.errorSignal.emit(tr("Busy"), tr("Busy"))
+            return
+        self.erasing = True
+        self.erasingCanCancel = True
+        self.setEraseButton(True) # show cancel button
+        self.eraseResultSignal.emit(False, "", True)
+        isChipeErase = False
+        if self.eraseModeCombobox.currentText() == tr("Chip erase"):
+            isChipeErase = True
+        if not isChipeErase:
+            try:
+                addr = self.eraseAddr.text()
+                if addr.startswith("0x"):
+                    addr = int(addr, 16)
+                else:
+                    addr = int(addr, 10)
+            except Exception:
+                self.errorSignal.emit(tr("Address error"), tr("Address error"))
+                self.erasing = False
+                self.setEraseButton(False)
+                return
+            try:
+                length_text = self.eraseLen.text()
+                if length_text.startswith("0x"):
+                    length = int(length_text, 16)
+                else:
+                    length = int(length_text)
+                unit = self.eraseLenUnit.currentText()
+                if unit == "MiB":
+                    length *= 1024 * 1024
+                elif unit == "KiB":
+                    length *= 1024
+            except Exception:
+                self.errorSignal.emit(tr("Length error"), tr("Length error"))
+                self.erasing = False
+                self.setEraseButton(False)
+                return
+            if (addr ==0 and length == 0) or (addr != 0 and length == 0) or addr < 0 or length < 0:
+                self.errorSignal.emit(tr("Address and length error"), tr("Address and length error"))
+                self.erasing = False
+                self.setEraseButton(False)
+                return
+            if addr + length > 16 * 1024 * 1024: # limit 16MiB
+                reply = QMessageBox.question(self, tr("Continue") + " ?",
+                                     f'{addr + length} > 16MiB, ' + tr("Continue") + " ?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if reply != QMessageBox.Yes:
+                    self.erasing = False
+                    self.setEraseButton(False)
+                    return
+            eraseTimeEstimate = math.ceil(length/65536*0.2) # 0.16s~0.3s every block(64K), full chip ~50s, 0.07s every sector(4K)
+        else: # full chip erase
+            addr = 0
+            length = "all"
+            eraseTimeEstimate = math.ceil(50) # 16MiB Flash full chip erase time
+            length_text = "16"
+            unit = "MiB"
+
+        config, err, msg = self.getSerialSettings()
+        if not config:
+            self.errorSignal.emit(err, msg)
+            self.erasing = False
+            self.setEraseButton(False)
+            return
+        
+        self.eraseStatus.setText("<font color=%s>%s</font>" %("#0eb40e", tr("Preparing Erase") ))
+        eraseThread = threading.Thread(target=self.eraseProcess, args=(addr, length, config['dev'], config['baud'], config['board'], config['color'], config['slow']))
+        eraseThread.setDaemon(True)
+        eraseThread.start()
+        eraseStatusThread = threading.Thread(target=self.updateEraseStatus, args=(length_text, unit, eraseTimeEstimate))
+        eraseStatusThread.setDaemon(True)
+        eraseStatusThread.start()
+    
+    def setEraseButton(self, cancel):
+        self.eraseButton.setEnabled(True)
+        if cancel:
+            self.eraseButton.setText(tr("Cancel"))
+            self.eraseButton.setProperty("class", "redbutton")
+            self.eraseButton.style().unpolish(self.eraseButton)
+            self.eraseButton.style().polish(self.eraseButton)
+            self.eraseButton.update()
+        else:
+            self.eraseButton.setText(tr("Erase"))
+            self.eraseButton.setProperty("class", "normalbutton")
+            self.eraseButton.style().unpolish(self.eraseButton)
+            self.eraseButton.style().polish(self.eraseButton)
+            self.eraseButton.update()
+    
+    def setEraseStatus(self, msg):
+        self.eraseStatus.setText(msg)
+    
+    def eraseLoadConfig(self):
+        configName = self.eraseLoadConfigCombobox.currentText()
+        config = self.eraseTemplateConfigs
+        if configName in config and config[configName][2] in self.units:
+            self.eraseModeCombobox.setCurrentText(tr("Partial erase"))
+            self.eraseAddr.setDisabled(False)
+            self.eraseLen.setDisabled(False)
+            self.eraseLenUnit.setDisabled(False)
+            self.eraseAddr.setText(config[configName][0])
+            self.eraseLen.setText(config[configName][1])
+            self.eraseLenUnit.setCurrentText(config[configName][2])
+        else:
+            self.errorSignal.emit(tr("Error"), tr("Load erase config file error"))
+
+    def onEraseProgress(self, fileTypeStr, current, total, speedStr):
+        if current >= total:
+            self.erasingCanCancel = False
+            self.eraseButton.setDisabled(True)
+
+    def updateEraseStatus(self, length_text, unit, timeEstimate):
+        timeElapsed = 0
+        while self.erasing:
+            if self.erasingCanCancel:
+                time.sleep(0.1)
+                continue
+            timeLast = timeEstimate - timeElapsed
+            if timeLast < 0:
+                timeLast = 0
+            msg = "<font color=%s>%s</font>" %("#0eb40e", 
+                    tr("Erase")+" {}{}, wait about {} S".format(length_text, unit, timeLast) )
+            self.eraseStatusSignal.emit(msg)
+            timeElapsed += 1
+            time.sleep(1)
+
+    def eraseProcess(self, addr, length, dev, baud, board, color, slow):
+        errMsg = ""
+        success = True
+        try:
+            self.kflash.process(addr=str(addr), length=str(length), terminal=False, dev=dev, baudrate=baud, board=board, file="erase", noansi=not color, slow_mode=slow, callback=self.onEraseProgress)
+        except Exception as e:
+            errMsg = tr2(str(e))
+            if str(e) != "Burn SRAM OK":
+                success = False
+        if success:
+            self.eraseResultSignal.emit(True, errMsg, False)
+        else:
+            self.eraseResultSignal.emit(False, errMsg, False)
+
+    def eraseResult(self, success, msg, clear):
+        if clear:
+            self.statusBarStauts.setText("")
+            return
+        if success:
+            self.hintSignal.emit(tr("Success"), tr("Erase success"))
+            self.erasing = False # set here for updateEraseStatus
+            self.statusBarStauts.setText("<font color=%s>%s</font>" %("#1aac2d", tr("Erase success")))
+        else:
+            if msg == tr("Cancel"):
+                self.statusBarStauts.setText("<font color=%s>%s</font>" %("#ff1d1d", tr("Erase Canceled")))
+                self.erasing = False # set here for updateEraseStatus
+            else:
+                msg = tr("ErrorSettingHint") + "\n\n"+msg
+                self.errorSignal.emit(tr("Error"), msg)
+                self.erasing = False # set here for updateEraseStatus
+                self.statusBarStauts.setText("<font color=%s>%s</font>" %("#ff1d1d", tr("Erase fail")))
+        self.eraseStatus.setText('')
+        self.setEraseButton(False)
 
     def fileSelectShow(self, item, name, addr=None, firmware=None, enable=True, loadFirst = False):
         isKfpkg = False
@@ -443,8 +739,8 @@ class MainWindow(QMainWindow):
             try:
                 addr = int(item[4].text(),16)
                 if enable:
-                    if addr%(0x10000) != 0: # 64KiB align
-                        return (None, tr("Adress must align with 64KiB(0x10000)"))
+                    if addr%(0x1000) != 0: # 4KiB align
+                        return (None, tr("Adress must align with 4KiB(0x1000)"))
             except Exception:
                 addr = 0
             if not enable:
@@ -462,12 +758,15 @@ class MainWindow(QMainWindow):
                 if fileType == "kfpkg":
                     return (None, tr("Can not select kfpkg and bin files at the time"))
                 fileType = "bin"
-                files.append( (path, addr, item[6] , enable) )
+                prefix = item[6]
+                files.append( (path, addr, prefix, enable) )
+        if len(files) == 0:
+            return (None, tr("Please select file"))
         return (fileType, files)
 
     class KFPKG():
         def __init__(self):
-            self.fileInfo = {"version": "0.1.0", "files": []}
+            self.fileInfo = {"": "0.1.0", "files": []}
             self.filePath = {}
             self.burnAddr = []
         
@@ -606,7 +905,7 @@ class MainWindow(QMainWindow):
         try:
             zip = zipfile.ZipFile(kfpkg, mode="r")
             zip.extract(listFileName, tempDir)
-            with open(tempDir+"/"+listFileName) as f:
+            with open(os.path.join(tempDir, listFileName)) as f:
                 info = json.load(f)
             filesInfo = {}
             for fileInfo in info["files"]:
@@ -812,7 +1111,7 @@ class MainWindow(QMainWindow):
 
     def programExitSaveParameters(self):
         paramObj = paremeters_save.ParametersToSave()
-        paramObj.board    = self.boardCombobox.currentText()
+        paramObj.board    = self.boardCombobox.currentIndex()
         paramObj.burnPosition = self.burnPositionCombobox.currentText()
         paramObj.baudRate = self.serailBaudrateCombobox.currentIndex()
         paramObj.skin = self.param.skin
@@ -829,6 +1128,12 @@ class MainWindow(QMainWindow):
             paramObj.slowMode = True
         else:
             paramObj.slowMode = False
+        
+        if self.spiFlashIoModeCombobox.currentIndex()==0:
+            paramObj.ioMode = "dio"
+        else:
+            paramObj.ioMode = "qio"
+
         paramObj.save(parameters.configFilePath)
 
     def programStartGetSavedParameters(self):
@@ -850,7 +1155,9 @@ class MainWindow(QMainWindow):
                 else:
                     self.fileSelectShow(None, path, addr, firmware, enable=enable, loadFirst = False)
                 count += 1
-        self.boardCombobox.setCurrentText(self.param.board)
+        if type(self.param.board) == str:
+            self.param.board = 0
+        self.boardCombobox.setCurrentIndex(self.param.board)
         self.burnPositionCombobox.setCurrentText(self.param.burnPosition)
         self.serailBaudrateCombobox.setCurrentIndex(self.param.baudRate)
         if self.param.slowMode:
@@ -858,9 +1165,18 @@ class MainWindow(QMainWindow):
         else:
             self.slowModeCombobox.setCurrentIndex(1)
 
+        if self.param.ioMode == 'dio':
+            self.spiFlashIoModeCombobox.setCurrentIndex(0)
+        else:
+            self.spiFlashIoModeCombobox.setCurrentIndex(1)
+
     def closeEvent(self, event):
         try:
             self.programExitSaveParameters()
+            self.kflash.kill()
+            self.kflash.checkKillExit()
+        except Exception:
+            pass
         finally:
             event.accept()
 
@@ -909,7 +1225,7 @@ class MainWindow(QMainWindow):
         percent = current/float(total)*100
         hint = "<font color=%s>%s %s:</font>   <font color=%s> %.2f%%</font>   <font color=%s> %s</font>" %("#ff7575", tr("Downloading"), fileTypeStr, "#2985ff", percent, "#1aac2d", speedStr)
         self.progressHint.setText(hint)
-        self.progressbar.setValue(percent)
+        self.progressbar.setValue(int(percent))
     
     def updateProgressPrint(self, str):
         self.statusBarStauts.setText(str)
@@ -924,6 +1240,40 @@ class MainWindow(QMainWindow):
 
     def progress(self, fileTypeStr, current, total, speedStr):
         self.updateProgressSignal.emit(fileTypeStr, current, total, speedStr)
+
+    def getSerialSettings(self):
+        color = False
+        board = "dan"
+        boardText = self.boardCombobox.currentText()
+        board = self.boardsInfo[boardText]
+
+        sram = False
+        if self.burnPositionCombobox.currentText()==tr("SRAM") or \
+            self.burnPositionCombobox.currentText()==tr_en("SRAM"):
+            sram = True
+        try:
+            baud = int(self.serailBaudrateCombobox.currentText())
+        except Exception:
+            return (None, tr("Error"), tr("BaudrateError"))
+            
+        dev = ""
+        try:
+            dev  = self.serialPortCombobox.currentText().split()[0]
+        except Exception:
+            pass
+        if dev=="":
+            return (None, tr("Error"), tr("PleaseSelectSerialPort"))
+        slow = self.slowModeCombobox.currentIndex()==0
+        iomode = "dio" if self.spiFlashIoModeCombobox.currentIndex()==0 else "qio"
+        return ({
+            "color": color,
+            "board": board,
+            "sram": sram,
+            "dev": dev,
+            "slow": slow,
+            "baud": baud,
+            "iomode": iomode
+        },None, None)
 
     def download(self):
         if self.packing:
@@ -946,48 +1296,13 @@ class MainWindow(QMainWindow):
         #     self.errorSignal.emit(tr("Error"), tr("FilePathError"))
         #     self.burning = False
         #     return
-        color = False
-        board = "dan"
-        boardText = self.boardCombobox.currentText()
-        if boardText == parameters.SipeedMaixGo:
-            board = "goE"
-        elif boardText == parameters.SipeedMaixGoD:
-            board = "goD"
-        elif boardText == parameters.SipeedMaixduino:
-            board = "maixduino"
-        elif boardText == parameters.SipeedMaixBit:
-            board = "bit"
-        elif boardText == parameters.SipeedMaixBitMic:
-            board = "bit_mic"
-        elif boardText == parameters.KendryteKd233:
-            board = "kd233"
-        elif boardText == parameters.kendryteTrainer:
-            board = "trainer"
-        elif boardText == parameters.M5StickV:
-            board = "goE"
-        elif boardText == parameters.Auto:
-            board = None
+        
+        config, err, msg = self.getSerialSettings()
+        if not config:
+            self.errorSignal.emit(err, msg)
+            self.burning = False
+            return
 
-        sram = False
-        if self.burnPositionCombobox.currentText()==tr("SRAM") or \
-            self.burnPositionCombobox.currentText()==tr_en("SRAM"):
-            sram = True
-        try:
-            baud = int(self.serailBaudrateCombobox.currentText())
-        except Exception:
-            self.errorSignal.emit(tr("Error"), tr("BaudrateError"))
-            self.burning = False
-            return
-        dev = ""
-        try:
-            dev  = self.serialPortCombobox.currentText().split()[0]
-        except Exception:
-            pass
-        if dev=="":
-            self.errorSignal.emit(tr("Error"), tr("PleaseSelectSerialPort"))
-            self.burning = False
-            return
-        slow = self.slowModeCombobox.currentIndex()==0
         # hide setting widgets
         self.setFrameStrentch(1)
         self.settingWidget.hide()
@@ -1004,11 +1319,11 @@ class MainWindow(QMainWindow):
         hint = "<font color=%s>%s</font>" %("#ff0d0d", tr("DownloadStart"))
         self.progressHint.setText(hint)
         # download
-        self.burnThread = threading.Thread(target=self.flashBurnProcess, args=(dev, baud, board, sram, fileType, filesInfo, self.progress, color, slow))
-        self.burnThread.setDaemon(True)
-        self.burnThread.start()
+        burnThread = threading.Thread(target=self.flashBurnProcess, args=(config['dev'], config['baud'], config['board'], config['sram'], fileType, filesInfo, self.progress, config['color'], config['slow'], config['iomode']))
+        burnThread.setDaemon(True)
+        burnThread.start()
 
-    def flashBurnProcess(self, dev, baud, board, sram, fileType, files, callback, color, slow):
+    def flashBurnProcess(self, dev, baud, board, sram, fileType, files, callback, color, slow, io_mode):
         success = True
         errMsg = ""
         tmpFile = ""
@@ -1040,10 +1355,7 @@ class MainWindow(QMainWindow):
                     success = False
         if success:
             try:
-                if board:
-                    self.kflash.process(terminal=False, dev=dev, baudrate=baud, board=board, sram = sram, file=filename, callback=callback, noansi=not color, slow_mode=slow)
-                else:
-                    self.kflash.process(terminal=False, dev=dev, baudrate=baud, sram = sram, file=filename, callback=callback, noansi=not color, slow_mode=slow)
+                self.kflash.process(terminal=False, dev=dev, baudrate=baud, board=board, sram = sram, file=filename, callback=callback, noansi=not color, slow_mode=slow, io_mode=io_mode)
             except Exception as e:
                 errMsg = tr2(str(e))
                 if str(e) != "Burn SRAM OK":
